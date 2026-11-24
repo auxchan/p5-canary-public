@@ -1,0 +1,1148 @@
+#!/usr/bin/env python3
+"""Shared, deterministic, conflict-safe writeback for AUXSAYS automation workflows.
+
+Every workflow that commits generated outputs to ``main`` (patch evidence collection,
+patch ingestion, the DaVinci writers, ...) previously did a plain ``git add`` /
+``git commit`` / ``git push`` followed by a single ``gh workflow run pages.yml``. Two gaps:
+
+  1. RACE: a *separate* workflow (patch-ingest) can push to ``main`` between another
+     workflow's checkout and its push -> non-fast-forward rejection -> failed run ->
+     delayed publication. The shared concurrency group reduces but cannot eliminate this,
+     so a pre-push fetch/rebase/retry mechanism is mandatory.
+  2. UNDEPLOYED COMMIT: the content push can succeed while the single Pages dispatch fails.
+     The pushed revision then stays undeployed, and later no-change runs (which see no file
+     changes) never redeploy it. This is repaired here with bounded Pages-dispatch retries
+     plus a deterministic no-change deployment-recovery path that re-dispatches Pages when
+     the exact current ``origin/main`` SHA is not already a completed+success ``pages.yml``
+     deployment -- WITHOUT repeating the push or creating an empty commit.
+
+This module performs, against an ALREADY-checked-out repo whose working tree already holds
+the freshly generated changes:
+
+  * stage ONLY explicitly permitted pathspecs; reject any unexpected/forbidden staged path
+  * refuse the whole run when the working tree holds material the commit candidate does not
+    (unstaged tracked change/deletion, or a non-ignored untracked file), so the state a validator
+    reads is always the state that gets committed: VALIDATED TREE == COMMITTED TREE
+  * empty staged diff -> no_changes; then, IFF deploy-recovery is enabled for this workflow,
+    verify the current main SHA is deployed and re-dispatch Pages if not (never on every run)
+  * create the bot commit; fetch origin/<branch> immediately before each push; rebase the
+    single bot commit when origin advanced; rerun validation + re-verify allowed paths;
+    push with a bounded retry limit
+  * after a confirmed successful material push, dispatch Pages with bounded retries and
+    deterministic backoff; on final dispatch failure set deployment_pending and fail visibly
+    while preserving pushed / pushed_sha (a deployment-dispatch failure is NOT a push failure)
+  * a site-affecting push with NO configured Pages command fails loudly (a github.token push does
+    not trigger pages.yml, so a missing --pages-cmd would silently never deploy) -- never exit 0
+  * OPTIONALLY (opt-in ``pages_confirm_build``) poll the Pages runs that would deploy the pushed
+    revision to a terminal state and surface a BUILD failure, since a successful dispatch is not a
+    successful deploy; when off, build-outcome confirmation is delegated to the next
+    deployment-recovery cycle. A build created by this dispatch that genuinely fails fails the run;
+    a run cancelled because a newer build superseded it is not a failure (the newer build, of a
+    descendant, deploys this content); a wait that ends with no verdict is reported as
+    ``deployment_unverified`` (output, outcome token, annotation, step summary). ONE monotonic
+    deadline bounds the whole wait (``confirm_wait_bound``): every status query, every git fetch
+    and every sleep is cut to the time left before it, and a query or fetch still running at its
+    limit is killed without waiting for the processes it started
+  * classify a writeback that lost a race with another push to main and pushed nothing as
+    ``lost_race`` (output, summary line). Diagnostic only: the writer-queue reaper re-runs EVERY
+    routine cycle that did not reach main, whatever the reason, from the workflows' own record
+
+It never force-pushes, never uses ``--ours``/``--theirs`` or ``-X ours``/``-X theirs``, and
+never silently resolves a conflict on a shared generated/evidence/state/catalog file.
+
+Outcome tokens are emitted one-per-line (``WRITEBACK_OUTCOME:``) plus a final
+``WRITEBACK_SUMMARY:`` JSON line; inside GitHub Actions, outputs (outcome / changed /
+deploy_changed / pushed / pushed_sha / deployment_pending / pages_build / deployment_unverified /
+lost_race) are written to ``$GITHUB_OUTPUT`` and a pending or unverified deployment note to
+``$GITHUB_STEP_SUMMARY``.
+
+CLI (workflows) and importable ``run_writeback(config)`` (tests). Pages status queries, sleeps
+and the clock are injectable so tests are deterministic and never sleep or hit the network.
+"""
+from __future__ import annotations
+
+import argparse
+import fnmatch
+import json
+import os
+import subprocess
+import sys
+import tempfile
+import time
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Callable
+
+FORBIDDEN_PATH_SUBSTRINGS = (
+    "/_site/", "_site/", "node_modules/", ".jekyll-cache/", "__pycache__/",
+)
+FORBIDDEN_PATH_GLOBS = (
+    "*.pyc", "*.tmp", "AGENTS.md", "CLAUDE.md", "**/AGENTS.md", "**/CLAUDE.md",
+)
+
+DEFAULT_PAGES_STATUS_CMD = (
+    "gh run list --workflow pages.yml --branch main --limit 30 "
+    "--json databaseId,headSha,headBranch,status,conclusion"
+)
+
+# --- outcome tokens ----------------------------------------------------------
+NO_CHANGES = "no_changes"
+PUSH_SUCCESS_FIRST_ATTEMPT = "push_success_first_attempt"
+UPSTREAM_ADVANCED = "upstream_advanced"
+REBASE_SUCCESS = "rebase_success"
+VALIDATION_SUCCESS_AFTER_REBASE = "validation_success_after_rebase"
+PUSH_SUCCESS_AFTER_RETRY = "push_success_after_retry"
+REBASE_CONFLICT = "rebase_conflict"
+UNEXPECTED_CHANGED_PATH = "unexpected_changed_path"
+VALIDATION_FAILED_AFTER_REBASE = "validation_failed_after_rebase"
+RETRY_EXHAUSTED = "retry_exhausted"
+PAGES_DISPATCH_ATTEMPT = "pages_dispatch_attempt"
+PAGES_DISPATCH_RETRY = "pages_dispatch_retry"
+PAGES_DISPATCH_SUCCESS = "pages_dispatch_success"
+PAGES_DISPATCH_FAILED = "pages_dispatch_failed"
+PAGES_DISPATCH_SKIPPED_NO_CHANGES = "pages_dispatch_skipped_no_changes"
+PAGES_DISPATCH_SKIPPED_PUSH_FAILURE = "pages_dispatch_skipped_push_failure"
+DEPLOYMENT_CURRENT = "deployment_current"
+DEPLOYMENT_MISSING = "deployment_missing"
+VALIDATION_FAILED_PRE_COMMIT = "validation_failed_pre_commit"
+# opt-in Pages BUILD-outcome confirmation (a successful dispatch is NOT a successful deploy)
+PAGES_BUILD_CONFIRMED = "pages_build_confirmed"
+PAGES_BUILD_FAILED = "pages_build_failed"
+PAGES_BUILD_UNCONFIRMED = "pages_build_unconfirmed"
+# The bounded wait ended with no verdict for the pushed revision: no Pages run for it appeared, it
+# had not finished, or it was superseded by a newer build that had not finished (or that failed on
+# a later revision). The data commit is on main and stays there; the lane does not fail for this (a
+# slow or superseded Pages queue is not a fault of this lane), but it says so in an output, an
+# annotation and the step summary. The next no-change --deploy-recovery cycle re-checks whether the
+# current main revision is a completed, successful deployment and re-dispatches Pages when it is
+# not. The writer-queue reaper carries it from there: until a successful Pages run deploys main's
+# newest commit -- which contains this push -- the incident stays open, and once main has gone
+# undeployed longer than its grace period it is a problem line on the one tracking issue
+# (writer_cycle_recovery.deployment_state).
+DEPLOYMENT_UNVERIFIED = "deployment_unverified"
+# a site-affecting revision was pushed but the lane configured no Pages dispatch command
+DEPLOY_CHANGED_NO_PAGES_CMD = "deploy_changed_no_pages_cmd"
+UNSTAGED_CHANGED_PATH = "unstaged_changed_path"
+EVIDENCE_LOSS_REFUSED = "evidence_loss_refused"
+
+# A LOST RACE: another push reached main after this run checked out, and this run pushed nothing
+# because of it. Run 44878227542 lost a whole collection cycle that way (a PR touching the evidence
+# store merged mid-run -> rebase_conflict). These three terminal outcomes are the ones caused by the
+# timing rather than by the work: the rebase was refused, the rebased tree failed validation, or main
+# kept moving until the retries ran out. A post-rebase unexpected path or a residual working-tree
+# file is a defect in this run's own output and is never classified as a lost race. The
+# classification is a DIAGNOSTIC (the `lost_race` output and the run summary): recovery does not key
+# on it. The writer-queue reaper re-runs, once, every routine cycle whose writeback did not reach
+# main -- a lost race, a refusal, a failure or timeout after collection -- and nothing merges two
+# versions of the evidence: the re-run collects the whole cycle again from a fresh checkout of main.
+RECOVERABLE_LOST_RACE_OUTCOMES = frozenset({
+    REBASE_CONFLICT, VALIDATION_FAILED_AFTER_REBASE, RETRY_EXHAUSTED,
+})
+
+# The store the evidence-loss gate protects. Mirrors lib/evidence_loss.EVIDENCE_PATH; it is a literal
+# here rather than an import because this module is executed as a bare script by every writer
+# workflow and carries no import-time dependency beyond the standard library (see
+# _evidence_loss_module). test_evidence_loss_guard asserts the two constants are equal.
+EVIDENCE_PATH = "auxsays/_data/consensus_evidence.yml"
+
+# How many individual losses a refusal names. A purge can remove hundreds of rows; the summary
+# must stay one readable screen, and the count of what was elided is always stated.
+MAX_REPORTED_LOSSES = 25
+
+
+@dataclass
+class WritebackConfig:
+    repo: Path
+    message: str
+    allow: list[str]
+    validate: list[str] = field(default_factory=list)
+    validate_before_commit: bool = False   # run `validate` against the staged tree BEFORE committing
+    site_paths: list[str] = field(default_factory=list)      # subset of allow that affects the site
+    max_retries: int = 5
+    branch: str = "main"
+    remote: str = "origin"
+    pages_cmd: str | None = None
+    pages_workflow: str = "pages.yml"
+    pages_ref: str = "main"
+    pages_max_attempts: int = 3
+    pages_backoff: list[int] = field(default_factory=lambda: [5, 15])  # delay after attempts 1,2
+    # opt-in: after a confirmed dispatch, poll the just-created pages run to a terminal state and
+    # surface a BUILD failure (dispatch rc==0 confirms only the DISPATCH, never the build/deploy).
+    # When off (default), build-outcome confirmation is delegated to the next --deploy-recovery cycle.
+    pages_confirm_build: bool = False
+    pages_confirm_attempts: int = 20            # poll iterations before giving up (-> unconfirmed)
+    pages_confirm_interval: int = 30            # seconds between polls (via sleep_fn)
+    author_name: str = "github-actions[bot]"
+    author_email: str = "41898282+github-actions[bot]@users.noreply.github.com"
+    # no-change deployment recovery
+    deploy_recovery: bool = False
+    recovery_site_paths: list[str] = field(default_factory=list)   # main HEAD must touch one of these
+    recovery_commit_grep: str | None = None                        # ... and its message must contain this
+    pages_status_cmd: str = DEFAULT_PAGES_STATUS_CMD
+    # Seconds one Pages status query may take. A query that has not answered by then reads as
+    # unreadable, exactly like a failed one. Inside the build wait every query is also cut to the
+    # time left before the wait's one deadline (confirm_wait_bound), so neither a hung `gh` nor a
+    # hung fetch can stretch the wait into the job's own time limit.
+    pages_status_timeout: float = 60.0
+    # The evidence store the loss gate protects. Repo-relative. Never disabled in production; tests
+    # point it at their own fixture store.
+    evidence_path: str = EVIDENCE_PATH
+    # injectables (tests)
+    sleep_fn: Callable[[float], None] = time.sleep
+    clock_fn: Callable[[], float] = time.monotonic
+    test_hook_before_push: str | None = None
+    test_hook_fires: int = 0
+
+
+@dataclass
+class WritebackResult:
+    outcome: str
+    outcomes: list[str] = field(default_factory=list)
+    changed: bool = False
+    deploy_changed: bool = False
+    pushed: bool = False
+    deployment_pending: bool = False
+    checkout_sha: str = ""
+    origin_sha_initial: str = ""
+    origin_sha_latest: str = ""
+    local_commit_sha: str = ""
+    rebased_commit_sha: str = ""
+    pushed_sha: str = ""
+    retry_number: int = 0
+    conflicting_paths: list[str] = field(default_factory=list)
+    validation: list[dict] = field(default_factory=list)
+    pages_attempts: int = 0
+    pages_backoff_applied: list[int] = field(default_factory=list)
+    pages_dispatched: bool = False
+    pages_build_outcome: str = ""   # "" (not checked) | confirmed | failed | unconfirmed
+    # True when build confirmation ran and did NOT confirm the build (failed or unconfirmed).
+    deployment_unverified: bool = False
+    # True when this run lost a race with another push to main and pushed nothing
+    # (RECOVERABLE_LOST_RACE_OUTCOMES); set once, by run_writeback, from the final state.
+    lost_race: bool = False
+    # The last refused push was refused because main had moved (git: non-fast-forward / fetch
+    # first), not by a hook, a branch rule or the network. Read only by _is_lost_race.
+    last_push_refused_by_race: bool = False
+    evidence_losses: list[str] = field(default_factory=list)
+    ok: bool = False
+
+    def as_dict(self) -> dict:
+        return {k: getattr(self, k) for k in (
+            "outcome", "outcomes", "changed", "deploy_changed", "pushed", "deployment_pending",
+            "checkout_sha", "origin_sha_initial", "origin_sha_latest", "local_commit_sha",
+            "rebased_commit_sha", "pushed_sha", "retry_number", "conflicting_paths", "validation",
+            "pages_attempts", "pages_backoff_applied", "pages_dispatched", "pages_build_outcome",
+            "deployment_unverified", "lost_race", "evidence_losses", "ok",
+        )}
+
+
+class WritebackError(RuntimeError):
+    def __init__(self, outcome: str, detail: str = "") -> None:
+        super().__init__(f"{outcome}: {detail}" if detail else outcome)
+        self.outcome = outcome
+        self.detail = detail
+
+
+def _git(repo: Path, *args: str, check: bool = True) -> subprocess.CompletedProcess:
+    proc = subprocess.run(["git", "-C", str(repo), *args], capture_output=True, text=True)
+    if check and proc.returncode != 0:
+        raise WritebackError("git_error", f"git {' '.join(args)} -> rc={proc.returncode}: {proc.stderr.strip()}")
+    return proc
+
+
+def _sha(repo: Path, ref: str) -> str:
+    return _git(repo, "rev-parse", ref).stdout.strip()
+
+
+def _ref_exists(repo: Path, ref: str) -> bool:
+    return _git(repo, "rev-parse", "--verify", "--quiet", ref, check=False).returncode == 0
+
+
+def _is_forbidden(path: str) -> bool:
+    p = path.replace("\\", "/")
+    if any(sub in f"/{p}" or p.startswith(sub) or f"/{sub}" in f"/{p}" for sub in FORBIDDEN_PATH_SUBSTRINGS):
+        return True
+    base = p.split("/")[-1]
+    return any(fnmatch.fnmatch(p, g) or fnmatch.fnmatch(base, g) for g in FORBIDDEN_PATH_GLOBS)
+
+
+def _matches_any(path: str, patterns: list[str]) -> bool:
+    p = path.replace("\\", "/")
+    for pat in patterns:
+        pat = pat.replace("\\", "/")
+        if p == pat or p.startswith(pat.rstrip("/") + "/"):
+            return True
+        if fnmatch.fnmatch(p, pat) or fnmatch.fnmatch(p, pat.rstrip("/") + "/*"):
+            return True
+    return False
+
+
+def _emit(result: WritebackResult, token: str) -> None:
+    result.outcomes.append(token)
+    print(f"WRITEBACK_OUTCOME: {token}", flush=True)
+
+
+def _staged_paths(repo: Path) -> list[str]:
+    # --no-renames: every path the commit changes, BOTH sides of a rename. With git's default rename
+    # detection a rename prints only its destination, so deleting a file while adding a >=50%-similar
+    # one elsewhere hid the deletion from every gate that reads this list. Measured: delete the
+    # evidence store and write most of it to an allowed `generated/*.md`, and the evidence-loss gate
+    # never saw the store path and pushed a main with no store; the allow/forbidden gate had the same
+    # blind spot for any tracked file renamed INTO an allowed glob.
+    out = _git(repo, "diff", "--cached", "--name-only", "--no-renames").stdout
+    return [ln.strip() for ln in out.splitlines() if ln.strip()]
+
+
+def _evidence_loss_module():
+    """lib/evidence_loss, imported only when the evidence store is actually staged.
+
+    Every writer workflow executes this file as a bare script (`python auxsays/scripts/lib/
+    automation_writeback.py`), where `lib` is not an importable package and sys.path[0] is this
+    directory. A top-level `from lib import evidence_loss` passes every test -- they import this
+    module AS `lib.automation_writeback` -- and raises ImportError in every production lane. So the
+    import is deferred to the one branch that needs it, and resolves in both modes."""
+    if __package__:
+        from . import evidence_loss  # imported as lib.automation_writeback (tests, orchestrator)
+    else:
+        import evidence_loss  # type: ignore[no-redef]  # executed as a script
+    return evidence_loss
+
+
+def _read_blob(repo: Path, spec: str, el) -> str | None:
+    """`spec` (`<sha>:<path>`, or `:<path>` for the index) as UTF-8 text; None when that path does not
+    exist there. Read as bytes and decoded strictly: `_git` decodes with the platform default, which
+    is cp1252 on Windows and mangles a store that carries non-ASCII report text."""
+    if subprocess.run(["git", "-C", str(repo), "cat-file", "-e", spec],
+                      capture_output=True).returncode != 0:
+        return None
+    proc = subprocess.run(["git", "-C", str(repo), "cat-file", "-p", spec], capture_output=True)
+    if proc.returncode != 0:
+        raise el.EvidenceStoreUnreadable("git could not read the evidence store")
+    try:
+        return proc.stdout.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise el.EvidenceStoreUnreadable("evidence store is not valid UTF-8") from exc
+
+
+def _refuse_evidence_loss(cfg: WritebackConfig, result: WritebackResult, staged: list[str]) -> bool:
+    """Fail-closed evidence-loss gate. True when the staged candidate fails to account for a row the
+    checked-out base held; the index is then reset and nothing is committed.
+
+    The base is the commit this run checked out -- the one reference a purge running in this job
+    cannot also rewrite. Every in-tree check downstream (QA, the consensus audit, the reconcile step)
+    compares the records against the SAME store the purge produced, so each confirms consistency by
+    construction; that is how a coherent 98% deletion used to pass all of them and get pushed.
+
+    Why pre-commit only, with no second check after a rebase: `_rebase` refuses any rebase whose
+    upstream commits touched a path this commit also touched, even a git-clean one. So if the store
+    is staged here, either upstream left the store alone -- and the rebased candidate's store is
+    byte-identical to the one judged here, against an unchanged base -- or the rebase is refused.
+    That argument needs `_rebase` to see both sides of a rename (--no-renames in _commit_paths and in
+    its upstream diff): with rename detection, an upstream that renamed the store listed only the
+    destination, no overlap was found, and merge-ort replayed this lane's rows into the renamed file
+    while the store left main."""
+    if not cfg.evidence_path or cfg.evidence_path not in staged:
+        return False
+    repo = cfg.repo
+    el = _evidence_loss_module()
+    try:
+        if not result.checkout_sha or not _ref_exists(repo, result.checkout_sha):
+            raise el.EvidenceStoreUnreadable("the checked-out base commit is not resolvable")
+        base = _read_blob(repo, f"{result.checkout_sha}:{cfg.evidence_path}", el)
+        # Absent from the index means the store itself was deleted: parse_store(None) is an empty
+        # candidate, so every base row reports as removed -- a deleted store is the largest purge.
+        candidate = _read_blob(repo, f":{cfg.evidence_path}", el)
+        losses = el.losses_between(base, candidate)
+    except el.EvidenceStoreUnreadable as exc:
+        # Fail closed. An unreadable store is never evidence that nothing was lost.
+        result.evidence_losses = [f"code={el.UNREADABLE} detail={str(exc)[:160]}"]
+    else:
+        if not losses:
+            return False
+        shown = [loss.public_reason() for loss in losses[:MAX_REPORTED_LOSSES]]
+        if len(losses) > MAX_REPORTED_LOSSES:
+            shown.append(f"... and {len(losses) - MAX_REPORTED_LOSSES} more identities "
+                         f"({sum(l.rows for l in losses)} rows in total)")
+        result.evidence_losses = shown
+    _git(repo, "reset", "-q")
+    for line in result.evidence_losses:
+        print(f"WRITEBACK_EVIDENCE_LOSS: {line}", flush=True)
+    _emit(result, EVIDENCE_LOSS_REFUSED)
+    result.outcome = EVIDENCE_LOSS_REFUSED
+    return True
+
+
+def _residual_paths(repo: Path) -> list[str]:
+    """Repository material the working tree holds that the commit candidate does NOT.
+
+    After ``git add -- <allow>`` the index IS the candidate commit, but ``_run_validation``
+    launches ordinary subprocesses that read the WORKING TREE. Anything present there and absent
+    from the candidate -- an unstaged modification or deletion of a tracked file, or a non-ignored
+    untracked file -- is material a validator can consume while ``git commit`` silently omits it.
+    That is exactly how a validator can pass on a state that never reaches ``main``:
+    evidence staged + an unallowed generated record modified in the working tree reads as a
+    coherent pair, while the commit publishes only the evidence half.
+
+    ``git status --porcelain`` already excludes .gitignore'd paths. That exclusion is deliberate
+    and measured: the genuinely transient artefacts these lanes produce (``_site``,
+    ``__pycache__``, ``*.pyc``, ``qa_status.json``, ``consensus_status.json``) are all ignored,
+    and any of them that somehow reached the index would still be refused by ``_is_forbidden``.
+    """
+    out = _git(repo, "status", "--porcelain").stdout
+    residual: list[str] = []
+    for line in out.splitlines():
+        if len(line) < 4:
+            continue
+        index_state, worktree_state, path = line[0], line[1], line[3:].strip()
+        if " -> " in path:          # rename/copy: the working-tree side is the destination
+            path = path.split(" -> ", 1)[1].strip()
+        path = path.strip('"')
+        if index_state == "?" and worktree_state == "?":
+            residual.append(path)   # untracked AND not ignored
+        elif worktree_state != " ":
+            residual.append(path)   # tracked, differs between working tree and index
+    return sorted(set(residual))
+
+
+def _refuse_residual(cfg: WritebackConfig, result: WritebackResult, reset_index: bool) -> bool:
+    """Fail-closed equivalence gate. True when residual material was found and the writeback must
+    stop: no validation, no commit, no push, no Pages dispatch. The working tree is deliberately
+    left untouched so the unexpected mutation stays visible for diagnosis -- it is never stashed,
+    reset or otherwise hidden, because a collector defect must not be silently absorbed."""
+    residual = _residual_paths(cfg.repo)
+    if not residual:
+        return False
+    if reset_index:
+        _git(cfg.repo, "reset", "-q")
+    result.conflicting_paths = residual
+    _emit(result, UNSTAGED_CHANGED_PATH)
+    result.outcome = UNSTAGED_CHANGED_PATH
+    return True
+
+
+def _commit_paths(repo: Path, commit: str) -> list[str]:
+    # --no-renames, for the same reason as _staged_paths: a rename must list BOTH paths. This feeds
+    # the rebase shared-path refusal, the post-rebase allow/forbidden check and deploy recovery, and
+    # each of them had the same blind spot for the source side of a rename.
+    out = _git(repo, "show", "--name-only", "--no-renames", "--pretty=format:", commit).stdout
+    return sorted({ln.strip() for ln in out.splitlines() if ln.strip()})
+
+
+def _run_validation(repo: Path, commands: list[str], result: WritebackResult) -> bool:
+    for cmd in commands:
+        proc = subprocess.run(cmd, shell=True, cwd=str(repo), capture_output=True, text=True)
+        result.validation.append({"cmd": cmd, "exit_code": proc.returncode})
+        print(f"WRITEBACK_VALIDATE: rc={proc.returncode} cmd={cmd}", flush=True)
+        if proc.returncode != 0:
+            sys.stderr.write(proc.stdout[-2000:] + "\n" + proc.stderr[-2000:] + "\n")
+            return False
+    return True
+
+
+# --- Pages status query + bounded dispatch -----------------------------------
+
+# The longest one git fetch inside the build wait may take, before the wait's deadline cuts it shorter.
+PAGES_FETCH_TIMEOUT = 60.0
+
+
+def confirm_wait_bound(attempts: int, interval: float, status_timeout: float) -> float:
+    """Seconds the whole build wait may last: the poll schedule, (attempts - 1) x interval, plus
+    one status query for the last poll. ONE monotonic deadline at this distance from the start of
+    the wait cuts every status query, every git fetch and every sleep inside it. The workflows'
+    job budgets are computed from this number (test_deploy_verification_and_lost_race D4, D12)."""
+    return max(attempts - 1, 0) * interval + status_timeout
+
+
+def _bounded(cmd, *, cwd: str, timeout: float, shell: bool = False,
+             capture: bool = True) -> tuple[int | None, str, str]:
+    """(returncode, stdout, stderr) of `cmd`, or (None, "", "") when it ran out of `timeout`.
+
+    A hard wall-clock limit. Output goes to temporary files, not pipes, and on timeout only the
+    direct child is killed and nothing waits for the processes it started: `subprocess.run(...,
+    capture_output=True, timeout=...)` kills the child and then waits for EOF on its pipes, which a
+    grandchild still holding them -- `git fetch`'s transport helper or upload-pack, or the command
+    under a shell that does not exec it -- keeps open for as long as it runs (measured: a 1.5 s
+    limit on a fetch from a remote whose upload-pack hangs returned after 20 s)."""
+    if timeout <= 0:
+        return None, "", ""
+    with tempfile.TemporaryFile() as out, tempfile.TemporaryFile() as err:
+        sink_out = out if capture else subprocess.DEVNULL
+        sink_err = err if capture else subprocess.DEVNULL
+        proc = subprocess.Popen(cmd, shell=shell, cwd=cwd, stdin=subprocess.DEVNULL,
+                                stdout=sink_out, stderr=sink_err)
+        try:
+            rc = proc.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                pass
+            return None, "", ""
+        out.seek(0)
+        err.seek(0)
+        return (rc, out.read().decode("utf-8", errors="replace"),
+                err.read().decode("utf-8", errors="replace"))
+
+
+def _pages_runs(cfg: WritebackConfig, timeout: float | None = None) -> tuple[list[dict], bool]:
+    """Return (runs, query_ok). query_ok is False when the status command itself failed
+    (e.g. missing token) or did not answer in time -- callers must NOT treat that as 'deployed'.
+    `timeout`, when given, cuts the query shorter than pages_status_timeout (the build wait passes
+    the time left before its deadline)."""
+    if not cfg.pages_status_cmd:
+        return [], False
+    limit = cfg.pages_status_timeout if timeout is None else min(timeout, cfg.pages_status_timeout)
+    rc, stdout, stderr = _bounded(cfg.pages_status_cmd, cwd=str(cfg.repo), timeout=limit, shell=True)
+    if rc is None:
+        sys.stderr.write(f"pages status query did not answer within {limit:.0f}s\n")
+        return [], False
+    if rc != 0:
+        sys.stderr.write(f"pages status query failed rc={rc}: {stderr.strip()}\n")
+        return [], False
+    try:
+        data = json.loads(stdout or "[]")
+    except json.JSONDecodeError:
+        return [], False
+    return (data, True) if isinstance(data, list) else ([], True)
+
+
+def _sha_deployed(cfg: WritebackConfig, sha: str) -> bool:
+    """True ONLY when a pages.yml run for exactly this SHA on the target branch is completed
+    with conclusion success. Older SHAs, other branches, queued/in-progress, and
+    failed/cancelled/skipped/timed-out runs are all insufficient. The status command already
+    scopes to `--workflow pages.yml --branch main`; we re-verify branch + exact SHA + terminal
+    success here so a mis-scoped command can never yield a false positive."""
+    runs, ok = _pages_runs(cfg)
+    if not ok:
+        return False
+    for run in runs:
+        if (str(run.get("headSha")) == sha
+                and str(run.get("headBranch")) == cfg.pages_ref
+                and str(run.get("status")) == "completed"
+                and str(run.get("conclusion")) == "success"):
+            return True
+    return False
+
+
+def _run_ids_for_sha(cfg: WritebackConfig, sha: str) -> set[str] | None:
+    """databaseIds of the pages runs already recorded for this exact SHA on the target branch.
+    Snapshotted BEFORE a dispatch so build confirmation can isolate the NEWLY created run from a
+    stale same-SHA run (e.g. an earlier FAILED build for a SHA that --deploy-recovery re-dispatches).
+
+    None -- not an empty set -- when the run list could not be read. An empty set would claim that
+    no run for this SHA existed, and a stale failed run would then be read as the new build's
+    result: a false "build failed" on exactly the deploy-recovery path this snapshot exists for."""
+    runs, ok = _pages_runs(cfg)
+    if not ok:
+        return None
+    return {str(run.get("databaseId")) for run in runs
+            if str(run.get("headSha")) == sha and str(run.get("headBranch")) == cfg.pages_ref}
+
+
+# A Pages run that ended in one of these failed to build or deploy. Anything else that is not
+# `success` -- above all `cancelled` -- is NOT a build failure: pages.yml shares one concurrency
+# group (`pages`, cancel-in-progress false), so a run still waiting in that group is cancelled the
+# moment a newer run enters it (a merge's push build, the daily cron, another lane's dispatch). The
+# newer run builds a descendant of the pushed revision, so it deploys the pushed content too.
+GENUINE_BUILD_FAILURES = frozenset({"failure", "timed_out", "startup_failure"})
+
+
+def _commit_known(repo: Path, sha: str) -> bool:
+    return _git(repo, "cat-file", "-e", f"{sha}^{{commit}}", check=False).returncode == 0
+
+
+def _fetch_bounded(cfg: WritebackConfig, timeout: float) -> bool:
+    """`git fetch <remote> <branch>`, killed when it has not finished within `timeout` (see
+    _bounded). True when it finished with rc 0. A fetch cut short leaves the run list's unknown
+    SHAs unknown, which only means they are not counted as descendants."""
+    rc, _out, _err = _bounded(["git", "-C", str(cfg.repo), "fetch", cfg.remote, cfg.branch],
+                              cwd=str(cfg.repo), timeout=timeout, capture=False)
+    return rc == 0
+
+
+def _descendants_of(cfg: WritebackConfig, sha: str, others: set[str], cache: dict[str, bool],
+                    deadline: float | None = None) -> set[str]:
+    """The subset of `others` that are strict descendants of `sha` -- a build of one of them deploys
+    `sha`'s content. Read-only. A commit this clone has not seen (a push that landed after ours) is
+    fetched, at most once per call, for at most PAGES_FETCH_TIMEOUT and never past `deadline` (the
+    build wait's, on cfg.clock_fn); writer checkouts are shallow, so older SHAs in the run list
+    stay unknown and are simply not descendants. A definite answer is cached; an unknown SHA is not,
+    so a descendant that lands later is still recognised."""
+    pending = {o for o in others if o and o != sha and o not in cache}
+    if any(not _commit_known(cfg.repo, o) for o in pending):
+        limit = PAGES_FETCH_TIMEOUT if deadline is None else min(PAGES_FETCH_TIMEOUT, deadline - cfg.clock_fn())
+        _fetch_bounded(cfg, limit)
+    for o in pending:
+        if _commit_known(cfg.repo, o):
+            cache[o] = _git(cfg.repo, "merge-base", "--is-ancestor", sha, o, check=False).returncode == 0
+    return {o for o in others if cache.get(o)}
+
+
+def _confirm_pages_build(cfg: WritebackConfig, result: WritebackResult, sha: str,
+                         pre_ids: set[str] | None) -> None:
+    """After a confirmed dispatch, optionally poll the Pages runs that would deploy `sha` to a
+    terminal state and surface a BUILD failure. Nothing here re-pushes, reverts or re-runs the
+    writeback. When `pages_confirm_build` is off (default) this is a no-op and confirmation is
+    delegated to the next --deploy-recovery cycle.
+
+    Which runs count:
+      * the runs for exactly `sha` that this dispatch created -- id not in `pre_ids`, the ids that
+        already existed for `sha` before the dispatch, so a stale same-SHA run is never mistaken
+        for the new build;
+      * any run for a DESCENDANT of `sha` on the target branch: it deploys this revision's content.
+
+    Verdicts:
+      * any counted run completed with success -> pages_build_confirmed;
+      * a run this dispatch created ended in GENUINE_BUILD_FAILURES -> pages_build_failed,
+        deployment_pending, ok False (the lane fails, as a failed dispatch already did);
+      * a run that was cancelled (superseded in the one-deep `pages` group) is not a failure: the
+        poll keeps watching for the newer build that superseded it;
+      * the wait ends with no verdict -> pages_build_unconfirmed + deployment_unverified: NOT a
+        failure of the run (the data commit is on main and correct), but reported unmistakably --
+        an outcome token, a ::warning annotation, the `deployment_unverified` output and a
+        step-summary section saying why. The writer-queue reaper keeps the incident open until a
+        successful Pages run deploys main's newest commit, and lists main as undeployed on its
+        tracking issue once that has lasted longer than its grace period.
+
+    How long: ONE monotonic deadline, confirm_wait_bound() from the start of the wait (19.5 min of
+    polls 30 s apart plus one 60 s query = 20.5 min in production). Every status query and every
+    git fetch is given at most the time left before it, every sleep is cut to it, and no poll
+    starts after it -- so the documented bound holds however slowly `gh` or the remote answer.
+
+    `pre_ids` None means the pre-dispatch snapshot could not be read. A failed run for `sha` then
+    cannot be attributed to this dispatch -- it may be the stale build the dispatch was meant to
+    replace -- so it never fails the lane; only a success confirms, and otherwise the deployment is
+    reported unverified with that reason."""
+    if not cfg.pages_confirm_build:
+        return
+    seen_new = False             # a run for `sha` created by this dispatch appeared in any poll
+    queried = False              # at least one poll could read the run list at all
+    superseded = False           # a run for `sha` was cancelled (or otherwise ended neutrally)
+    newer_failed = False         # a descendant's build ended in a genuine failure
+    unattributed_failure = False # a failed run for `sha` that pre_ids None leaves unattributable
+    pending_own = False          # in the last readable poll, a run for `sha` was still open
+    descendants: dict[str, bool] = {}
+    deadline = cfg.clock_fn() + confirm_wait_bound(cfg.pages_confirm_attempts, cfg.pages_confirm_interval,
+                                                   cfg.pages_status_timeout)
+    for attempt in range(1, cfg.pages_confirm_attempts + 1):
+        # A query with no time left does not run at all (_bounded), and reads as unreadable.
+        runs, ok = _pages_runs(cfg, timeout=deadline - cfg.clock_fn())
+        if ok:
+            queried = True
+            on_branch = [run for run in runs if str(run.get("headBranch")) == cfg.pages_ref]
+            own = [run for run in on_branch if str(run.get("headSha")) == sha
+                   and (pre_ids is None or str(run.get("databaseId")) not in pre_ids)]
+            later = _descendants_of(cfg, sha, {str(run.get("headSha") or "") for run in on_branch},
+                                    descendants, deadline)
+            newer = [run for run in on_branch if str(run.get("headSha") or "") in later]
+            seen_new = seen_new or bool(own)
+            done_own = [run for run in own if str(run.get("status")) == "completed"]
+            done_newer = [run for run in newer if str(run.get("status")) == "completed"]
+            pending_own = len(done_own) < len(own)
+            if any(str(run.get("conclusion")) == "success" for run in done_own + done_newer):
+                result.pages_build_outcome = "confirmed"
+                _emit(result, PAGES_BUILD_CONFIRMED)
+                return
+            own_failed = [run for run in done_own if str(run.get("conclusion")) in GENUINE_BUILD_FAILURES]
+            if own_failed and pre_ids is not None:
+                # terminal, genuinely failed build created by THIS dispatch
+                result.pages_build_outcome = "failed"
+                result.deployment_unverified = True
+                _emit(result, PAGES_BUILD_FAILED)
+                result.deployment_pending = True
+                result.ok = False
+                print(f"::error title=Pages build failed::The Pages build for {sha} ended "
+                      f"`{own_failed[0].get('conclusion')}`; the pushed revision is on main but not "
+                      "deployed.", flush=True)
+                _write_build_failure_summary(cfg, sha)
+                return
+            unattributed_failure = unattributed_failure or bool(own_failed)
+            superseded = superseded or any(str(run.get("conclusion")) not in GENUINE_BUILD_FAILURES
+                                           for run in done_own)
+            newer_failed = newer_failed or any(str(run.get("conclusion")) in GENUINE_BUILD_FAILURES
+                                               for run in done_newer)
+        if attempt < cfg.pages_confirm_attempts:
+            pause = min(cfg.pages_confirm_interval, deadline - cfg.clock_fn())
+            if pause <= 0:
+                break
+            cfg.sleep_fn(pause)
+    result.pages_build_outcome = "unconfirmed"
+    result.deployment_unverified = True
+    _emit(result, PAGES_BUILD_UNCONFIRMED)
+    _emit(result, DEPLOYMENT_UNVERIFIED)
+    if not queried:
+        reason = "the Pages run list could not be read"
+    elif pending_own:
+        reason = "the Pages run for this revision had not finished"
+    elif newer_failed:
+        reason = ("the Pages run for this revision was superseded and the newer build that would "
+                  "deploy it failed")
+    elif superseded:
+        reason = ("the Pages run for this revision was superseded (cancelled in the `pages` group) "
+                  "and the newer build had not finished")
+    elif unattributed_failure:
+        reason = ("a failed Pages run for this revision could not be attributed to this dispatch, "
+                  "because the run list before the dispatch could not be read")
+    elif seen_new:
+        reason = "the Pages run for this revision had not finished"
+    else:
+        reason = "no Pages run for this revision appeared"
+    waited = max(cfg.pages_confirm_attempts - 1, 0) * cfg.pages_confirm_interval
+    print(f"::warning title=Deployment unverified::{reason} within {waited}s; the pushed revision "
+          f"{sha} is on main and is not reverted or re-pushed.", flush=True)
+    _write_unverified_summary(cfg, sha, reason, waited)
+
+
+def _dispatch_pages_bounded(cfg: WritebackConfig, result: WritebackResult, pushed_sha: str) -> bool:
+    """Dispatch Pages with bounded retries and deterministic backoff. Returns True on a
+    confirmed dispatch; on final failure sets deployment_pending, records the pending
+    deployment to the step summary, and returns False. Never repeats the git push, never
+    creates a commit, never force-pushes.
+
+    A returned True confirms only the DISPATCH. When ``pages_confirm_build`` is enabled the
+    just-created build is then polled to a terminal state; a failed build sets deployment_pending
+    and clears ok while STILL returning True (the dispatch itself did happen)."""
+    origin_sha = _sha(cfg.repo, f"{cfg.remote}/{cfg.branch}") if _ref_exists(cfg.repo, f"{cfg.remote}/{cfg.branch}") else pushed_sha
+    pre_ids = _run_ids_for_sha(cfg, pushed_sha) if cfg.pages_confirm_build else set()
+    for attempt in range(1, cfg.pages_max_attempts + 1):
+        result.pages_attempts = attempt
+        proc = subprocess.run(cfg.pages_cmd, shell=True, cwd=str(cfg.repo), capture_output=True, text=True)
+        print(f"WRITEBACK_PAGES: {PAGES_DISPATCH_ATTEMPT} attempt={attempt} rc={proc.returncode} "
+              f"workflow={cfg.pages_workflow} ref={cfg.pages_ref} pushed_sha={pushed_sha} origin_main={origin_sha}", flush=True)
+        _emit(result, PAGES_DISPATCH_ATTEMPT)
+        if proc.returncode == 0:
+            result.pages_dispatched = True
+            _emit(result, PAGES_DISPATCH_SUCCESS)
+            _confirm_pages_build(cfg, result, pushed_sha, pre_ids)
+            return True
+        sys.stderr.write(f"pages dispatch attempt {attempt} failed rc={proc.returncode}: {proc.stderr.strip()}\n")
+        if attempt < cfg.pages_max_attempts:
+            delay = cfg.pages_backoff[attempt - 1] if attempt - 1 < len(cfg.pages_backoff) else (cfg.pages_backoff[-1] if cfg.pages_backoff else 0)
+            result.pages_backoff_applied.append(delay)
+            _emit(result, PAGES_DISPATCH_RETRY)
+            if delay:
+                cfg.sleep_fn(delay)
+    _emit(result, PAGES_DISPATCH_FAILED)
+    result.deployment_pending = True
+    _write_step_summary(cfg, pushed_sha, origin_sha)
+    return False
+
+
+def _write_step_summary(cfg: WritebackConfig, pushed_sha: str, origin_sha: str) -> None:
+    path = os.environ.get("GITHUB_STEP_SUMMARY")
+    if not path:
+        return
+    try:
+        with open(path, "a", encoding="utf-8") as h:
+            h.write("### ⚠️ Deployment pending\n\n")
+            h.write("The content push SUCCEEDED but the Pages deployment dispatch failed after "
+                    f"{cfg.pages_max_attempts} attempts. The pushed revision is on `{cfg.branch}` but not deployed.\n\n")
+            h.write(f"- pushed_sha: `{pushed_sha}`\n- origin/{cfg.branch}: `{origin_sha}`\n"
+                    f"- workflow: `{cfg.pages_workflow}` ref `{cfg.pages_ref}`\n")
+            h.write(f"- recover: `gh workflow run {cfg.pages_workflow} --ref {cfg.pages_ref}` "
+                    "(or the next scheduled recovery run will redeploy it automatically).\n")
+    except OSError:
+        pass
+
+
+def _write_build_failure_summary(cfg: WritebackConfig, sha: str) -> None:
+    path = os.environ.get("GITHUB_STEP_SUMMARY")
+    if not path:
+        return
+    try:
+        with open(path, "a", encoding="utf-8") as h:
+            h.write("### ⚠️ Deployment build failed\n\n")
+            h.write("The content push SUCCEEDED and the Pages dispatch SUCCEEDED, but the dispatched "
+                    "build reached a terminal non-success state, so the pushed revision is not deployed.\n\n")
+            h.write(f"- sha: `{sha}`\n- workflow: `{cfg.pages_workflow}` ref `{cfg.pages_ref}`\n")
+            h.write(f"- recover: `gh workflow run {cfg.pages_workflow} --ref {cfg.pages_ref}` "
+                    "(or the next scheduled recovery run will redeploy it automatically).\n")
+    except OSError:
+        pass
+
+
+def _write_unverified_summary(cfg: WritebackConfig, sha: str, reason: str, waited: int) -> None:
+    path = os.environ.get("GITHUB_STEP_SUMMARY")
+    if not path:
+        return
+    try:
+        with open(path, "a", encoding="utf-8") as h:
+            h.write("### ⚠️ Deployment unverified\n\n")
+            h.write("The content push SUCCEEDED and the Pages dispatch SUCCEEDED, but the deployment "
+                    f"could not be verified: {reason} within the bounded wait ({waited}s). The data "
+                    "commit is on main and is not reverted or re-pushed.\n\n")
+            h.write(f"- sha: `{sha}`\n- workflow: `{cfg.pages_workflow}` ref `{cfg.pages_ref}`\n")
+            h.write("- the next no-change deployment-recovery cycle re-checks the current main revision "
+                    "and re-dispatches Pages if it is not a completed, successful deployment; the "
+                    "writer-queue reaper lists main as undeployed on its tracking issue if no "
+                    "successful Pages run has deployed this commit or a later one within its grace "
+                    "period, and clears that line only when one has.\n")
+    except OSError:
+        pass
+
+
+def _write_missing_pages_cmd_summary(cfg: WritebackConfig, sha: str) -> None:
+    path = os.environ.get("GITHUB_STEP_SUMMARY")
+    if not path:
+        return
+    try:
+        with open(path, "a", encoding="utf-8") as h:
+            h.write("### ⚠️ Site change pushed with no Pages dispatch configured\n\n")
+            h.write("A site-affecting revision was pushed but this lane configured NO `--pages-cmd`. A "
+                    "`github.token` push does NOT trigger `pages.yml`, so the revision would silently "
+                    "never deploy. This lane is misconfigured: add `--pages-cmd` (and, for self-healing, "
+                    "`--deploy-recovery`).\n\n")
+            h.write(f"- pushed_sha: `{sha}`\n- branch: `{cfg.branch}`\n")
+    except OSError:
+        pass
+
+
+# --- rebase ------------------------------------------------------------------
+
+def _rebase(cfg: WritebackConfig, result: WritebackResult) -> bool:
+    """Rebase the single bot commit onto the advanced upstream. True on a clean, policy-safe
+    rebase; on any conflict emits rebase_conflict, restores the repo, returns False. A conflict
+    is EITHER a real git rebase conflict OR a git-clean rebase whose replayed commit shares any
+    modified path with the upstream commits added AFTER this workflow's original base SHA (two
+    jobs touched the same generated/evidence/state/catalog file -> never silently merged)."""
+    repo = cfg.repo
+    upstream = f"{cfg.remote}/{cfg.branch}"
+    base = result.checkout_sha
+    my_files = set(_commit_paths(repo, result.local_commit_sha))
+    # compare only changes AFTER the original base SHA, not all history of those paths
+    upstream_files = {
+        ln.strip() for ln in _git(repo, "diff", "--name-only", "--no-renames", base, upstream).stdout.splitlines()
+        if ln.strip()
+    }
+
+    proc = _git(repo, "rebase", upstream, check=False)
+    if proc.returncode != 0:
+        conflicts = sorted({
+            ln.strip() for ln in _git(repo, "diff", "--name-only", "--diff-filter=U").stdout.splitlines() if ln.strip()
+        })
+        _git(repo, "rebase", "--abort", check=False)
+        _git(repo, "reset", "--hard", result.local_commit_sha, check=False)
+        result.conflicting_paths = conflicts or sorted(my_files & upstream_files)
+        _emit(result, REBASE_CONFLICT)
+        result.outcome = REBASE_CONFLICT
+        return False
+
+    shared = sorted(my_files & upstream_files)
+    if shared:
+        _git(repo, "reset", "--hard", result.local_commit_sha, check=False)
+        result.conflicting_paths = shared
+        _emit(result, REBASE_CONFLICT)
+        result.outcome = REBASE_CONFLICT
+        return False
+
+    _emit(result, REBASE_SUCCESS)
+    return True
+
+
+# --- main flow ---------------------------------------------------------------
+
+def _no_change_recovery(cfg: WritebackConfig, result: WritebackResult) -> None:
+    """No material change: optionally ensure the exact current main SHA is deployed. Only runs
+    for a workflow with configured deploy-recovery responsibility, and only dispatches when the
+    current main HEAD is a not-yet-deployed, site-affecting (and, when configured, owned) commit.
+    Never dispatches on every no-change run."""
+    if not (cfg.deploy_recovery and cfg.pages_cmd):
+        _emit(result, PAGES_DISPATCH_SKIPPED_NO_CHANGES)
+        return
+    _git(cfg.repo, "fetch", cfg.remote, cfg.branch)
+    main_sha = _sha(cfg.repo, f"{cfg.remote}/{cfg.branch}")
+    result.origin_sha_latest = main_sha
+    if _sha_deployed(cfg, main_sha):
+        _emit(result, DEPLOYMENT_CURRENT)
+        return
+    if not _main_head_recoverable(cfg, main_sha):
+        # not deployed, but not this workflow's site-deployment responsibility -> abstain
+        _emit(result, DEPLOYMENT_CURRENT)
+        return
+    _emit(result, DEPLOYMENT_MISSING)
+    result.deploy_changed = True
+    if not _dispatch_pages_bounded(cfg, result, main_sha):
+        result.ok = False  # deployment_pending -> fail visibly (push was never the problem here)
+
+
+def _main_head_recoverable(cfg: WritebackConfig, main_sha: str) -> bool:
+    if cfg.recovery_site_paths:
+        files = _commit_paths(cfg.repo, main_sha)
+        if not any(_matches_any(f, cfg.recovery_site_paths) for f in files):
+            return False
+    if cfg.recovery_commit_grep:
+        msg = _git(cfg.repo, "log", "-1", "--format=%B", main_sha).stdout
+        if cfg.recovery_commit_grep not in msg:
+            return False
+    return True
+
+
+def _is_lost_race(result: WritebackResult) -> bool:
+    """True only when another push advanced main during this run AND the run ended in one of
+    RECOVERABLE_LOST_RACE_OUTCOMES. Each of those is a terminal outcome reached BEFORE any push
+    succeeds, so a run that pushed -- whatever then happened to its Pages dispatch or build, whose
+    `outcome` stays the push token -- is never a lost race. retry_exhausted is a race only when the
+    LAST push was refused because main had moved: pushes refused by a hook, a branch rule or the
+    network are not, even when main moved once earlier in the run and was rebased onto cleanly.
+    Diagnostic only; see RECOVERABLE_LOST_RACE_OUTCOMES."""
+    if result.outcome == RETRY_EXHAUSTED:
+        return result.last_push_refused_by_race
+    return (UPSTREAM_ADVANCED in result.outcomes
+            and result.outcome in RECOVERABLE_LOST_RACE_OUTCOMES)
+
+
+def _refused_by_race(push: subprocess.CompletedProcess) -> bool:
+    """git's own words for a push refused because the remote branch moved on: `! [rejected] ...
+    (fetch first)` or `(non-fast-forward)`. A hook's refusal reads `! [remote rejected] ...`."""
+    text = f"{push.stdout or ''}\n{push.stderr or ''}"
+    return "(fetch first)" in text or "(non-fast-forward)" in text
+
+
+def run_writeback(cfg: WritebackConfig) -> WritebackResult:
+    result = _run_writeback(cfg)
+    result.lost_race = _is_lost_race(result)
+    return result
+
+
+def _run_writeback(cfg: WritebackConfig) -> WritebackResult:
+    repo = cfg.repo
+    result = WritebackResult(outcome="")
+    result.checkout_sha = _sha(repo, "HEAD")
+
+    _git(repo, "config", "user.name", cfg.author_name)
+    _git(repo, "config", "user.email", cfg.author_email)
+    _git(repo, "add", "--", *cfg.allow)
+    staged = _staged_paths(repo)
+
+    bad = [p for p in staged if _is_forbidden(p) or not _matches_any(p, cfg.allow)]
+    if bad:
+        _git(repo, "reset", "-q")
+        result.conflicting_paths = sorted(bad)
+        _emit(result, UNEXPECTED_CHANGED_PATH)
+        result.outcome = UNEXPECTED_CHANGED_PATH
+        return result
+
+    # Equivalence gate. Everything below -- validation, the commit, the push -- assumes the
+    # working tree the validators read is the tree that will be committed. Enforce that here,
+    # BEFORE the first validator runs, rather than assuming it. This also covers the no-change
+    # branch: "nothing to commit" while a generated record sits modified in the working tree is a
+    # silently discarded mutation, not a quiet run.
+    if _refuse_residual(cfg, result, reset_index=True):
+        return result
+
+    if not staged:
+        _emit(result, NO_CHANGES)
+        result.outcome = NO_CHANGES
+        result.ok = True
+        _no_change_recovery(cfg, result)
+        return result
+
+    result.changed = True
+    result.deploy_changed = any(_matches_any(p, cfg.site_paths) for p in staged) if cfg.site_paths else True
+
+    # Evidence-loss gate. UNCONDITIONAL -- deliberately not one of the `--validate` commands, which
+    # only run before the commit when a lane passes --validate-before-commit, and two writer lanes
+    # (davinci-updates, promote-davinci-verified-reports) do not. Placed after the equivalence gate,
+    # so the index it reads is exactly what would be committed, and before the first commit, so a
+    # refusal leaves nothing behind.
+    if _refuse_evidence_loss(cfg, result, staged):
+        return result
+
+    # Transactional gate: validate BEFORE creating any commit, so an invalid tree (e.g. left
+    # dirty by a partial/failed upstream step) can never be committed. The validators still run as
+    # ordinary subprocesses against the working tree -- the guarantee that this equals the staged
+    # candidate comes from the equivalence gate above, which refused the run if the two could
+    # differ. Without that gate this comment overstated what the implementation delivered: a
+    # validator could pass on working-tree-only material that `git commit` would then omit.
+    # The git index is the staging area and `git commit` is the atomic replacement; on validation
+    # failure the index is reset and NO commit is created, so tracked files stay byte-identical.
+    if cfg.validate_before_commit and cfg.validate:
+        if not _run_validation(repo, cfg.validate, result):
+            _git(repo, "reset", "-q")
+            _emit(result, VALIDATION_FAILED_PRE_COMMIT)
+            result.outcome = VALIDATION_FAILED_PRE_COMMIT
+            return result
+
+    _git(repo, "commit", "-m", cfg.message)
+    result.local_commit_sha = _sha(repo, "HEAD")
+    result.origin_sha_initial = _sha(repo, f"{cfg.remote}/{cfg.branch}") if _ref_exists(repo, f"{cfg.remote}/{cfg.branch}") else ""
+
+    fires = 0
+    attempt = 0
+    rebased = False
+    while True:
+        _git(repo, "fetch", cfg.remote, cfg.branch)
+        upstream = f"{cfg.remote}/{cfg.branch}"
+        result.origin_sha_latest = _sha(repo, upstream)
+
+        contains = _git(repo, "merge-base", "--is-ancestor", upstream, "HEAD", check=False).returncode == 0
+        if not contains:
+            _emit(result, UPSTREAM_ADVANCED)
+            if not _rebase(cfg, result):
+                return result
+            rebased = True
+            result.rebased_commit_sha = _sha(repo, "HEAD")
+            # Same invariant on the retry path. A tracked modification would already have made
+            # `git rebase` itself fail, but a non-ignored UNTRACKED file survives a clean rebase,
+            # stays readable by the revalidation below, and is still never committed -- so the
+            # post-rebase validation needs the identical gate, not a weaker one.
+            if _refuse_residual(cfg, result, reset_index=False):
+                return result
+            if cfg.validate:
+                if not _run_validation(repo, cfg.validate, result):
+                    _git(repo, "reset", "--hard", result.local_commit_sha, check=False)
+                    _emit(result, VALIDATION_FAILED_AFTER_REBASE)
+                    result.outcome = VALIDATION_FAILED_AFTER_REBASE
+                    return result
+                _emit(result, VALIDATION_SUCCESS_AFTER_REBASE)
+            rebased_files = _commit_paths(repo, "HEAD")
+            bad = [p for p in rebased_files if _is_forbidden(p) or not _matches_any(p, cfg.allow)]
+            if bad:
+                _git(repo, "reset", "--hard", result.local_commit_sha, check=False)
+                result.conflicting_paths = sorted(bad)
+                _emit(result, UNEXPECTED_CHANGED_PATH)
+                result.outcome = UNEXPECTED_CHANGED_PATH
+                return result
+
+        # Final equivalence assertion: a validator (or any step between validation and here)
+        # must not have introduced material that the pushed commit will not carry.
+        if _refuse_residual(cfg, result, reset_index=False):
+            return result
+
+        if cfg.test_hook_before_push and fires < cfg.test_hook_fires:
+            fires += 1
+            subprocess.run(cfg.test_hook_before_push, shell=True, cwd=str(repo))
+
+        push = _git(repo, "push", cfg.remote, f"HEAD:{cfg.branch}", check=False)
+        if push.returncode == 0:
+            result.pushed = True
+            result.pushed_sha = _sha(repo, "HEAD")
+            result.retry_number = attempt
+            token = PUSH_SUCCESS_AFTER_RETRY if (rebased or attempt > 0) else PUSH_SUCCESS_FIRST_ATTEMPT
+            _emit(result, token)
+            result.outcome = token
+            result.ok = True
+            # dispatch Pages ONLY after a confirmed site-affecting push
+            if result.deploy_changed and not cfg.pages_cmd:
+                # Site-affecting revision pushed, but this lane configured NO --pages-cmd -> nothing
+                # dispatches Pages. A github.token push does NOT trigger pages.yml (on: push is inert
+                # for the bot actor: 0 of 176 bot commits ever produced an event=push pages run), so
+                # the revision would silently never deploy. Fail loudly instead of exiting 0, so a
+                # missing dispatch can never pass silently -- a future lane cannot forget --pages-cmd.
+                _emit(result, DEPLOY_CHANGED_NO_PAGES_CMD)
+                result.deployment_pending = True
+                result.ok = False
+                _write_missing_pages_cmd_summary(cfg, result.pushed_sha)
+            elif cfg.pages_cmd and result.deploy_changed:
+                if not _dispatch_pages_bounded(cfg, result, result.pushed_sha):
+                    result.ok = False  # pushed, but deployment pending -> fail visibly
+            elif cfg.pages_cmd:
+                _emit(result, PAGES_DISPATCH_SKIPPED_NO_CHANGES)
+            return result
+
+        result.last_push_refused_by_race = _refused_by_race(push)
+        attempt += 1
+        if attempt > cfg.max_retries:
+            _emit(result, RETRY_EXHAUSTED)
+            _emit(result, PAGES_DISPATCH_SKIPPED_PUSH_FAILURE)
+            result.retry_number = attempt
+            result.outcome = RETRY_EXHAUSTED
+            return result
+
+
+def _write_github_output(result: WritebackResult) -> None:
+    out_path = os.environ.get("GITHUB_OUTPUT")
+    if not out_path:
+        return
+    try:
+        with open(out_path, "a", encoding="utf-8") as handle:
+            handle.write(f"outcome={result.outcome}\n")
+            handle.write(f"changed={'true' if result.changed else 'false'}\n")
+            handle.write(f"deploy_changed={'true' if result.deploy_changed else 'false'}\n")
+            handle.write(f"pushed={'true' if result.pushed else 'false'}\n")
+            handle.write(f"pushed_sha={result.pushed_sha}\n")
+            handle.write(f"deployment_pending={'true' if result.deployment_pending else 'false'}\n")
+            handle.write(f"pages_build={result.pages_build_outcome}\n")
+            handle.write(f"deployment_unverified={'true' if result.deployment_unverified else 'false'}\n")
+            handle.write(f"lost_race={'true' if result.lost_race else 'false'}\n")
+    except OSError:
+        pass
+
+
+def build_parser() -> argparse.ArgumentParser:
+    """The CLI every writer workflow invokes. Separate from main() so a test can parse a workflow's
+    real argument list with the real parser instead of matching flag text."""
+    parser = argparse.ArgumentParser(description="Conflict-safe automation writeback + deployment recovery.")
+    parser.add_argument("--repo", default=".")
+    parser.add_argument("--branch", default="main")
+    parser.add_argument("--remote", default="origin")
+    parser.add_argument("--message", required=True)
+    parser.add_argument("--allow", action="append", default=[])
+    parser.add_argument("--site-path", action="append", default=[], dest="site_paths")
+    parser.add_argument("--validate", action="append", default=[])
+    parser.add_argument("--validate-before-commit", action="store_true",
+                        help="Run every --validate command against the staged tree BEFORE committing; "
+                             "on failure, reset the index and make no commit (transactional gate).")
+    parser.add_argument("--max-retries", type=int, default=5)
+    parser.add_argument("--pages-cmd", default=None)
+    parser.add_argument("--pages-workflow", default="pages.yml")
+    parser.add_argument("--pages-ref", default="main")
+    parser.add_argument("--pages-max-attempts", type=int, default=3)
+    parser.add_argument("--pages-backoff", default="5,15", help="comma-separated seconds after attempts 1,2,...")
+    parser.add_argument("--pages-confirm-build", action="store_true",
+                        help="After a successful dispatch, poll the just-created pages run to a terminal "
+                             "state and fail visibly if the build did not succeed (dispatch != deploy). "
+                             "A wait that ends with no terminal build reports deployment_unverified "
+                             "without failing. When off (default), build-outcome confirmation is "
+                             "delegated to the next --deploy-recovery cycle.")
+    parser.add_argument("--pages-confirm-attempts", type=int, default=20)
+    parser.add_argument("--pages-confirm-interval", type=int, default=30)
+    parser.add_argument("--deploy-recovery", action="store_true")
+    parser.add_argument("--recovery-site-path", action="append", default=[], dest="recovery_site_paths")
+    parser.add_argument("--recovery-commit-grep", default=None)
+    parser.add_argument("--pages-status-cmd", default=DEFAULT_PAGES_STATUS_CMD)
+    parser.add_argument("--author-name", default="github-actions[bot]")
+    parser.add_argument("--author-email", default="41898282+github-actions[bot]@users.noreply.github.com")
+    parser.add_argument("--json-out", default=None)
+    parser.add_argument("--test-hook-before-push", default=None, help=argparse.SUPPRESS)
+    parser.add_argument("--test-hook-fires", type=int, default=0, help=argparse.SUPPRESS)
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    if not args.allow:
+        parser.error("at least one --allow pathspec is required")
+
+    backoff = [int(x) for x in str(args.pages_backoff).split(",") if x.strip()]
+    cfg = WritebackConfig(
+        repo=Path(args.repo).resolve(), message=args.message, allow=args.allow, validate=args.validate,
+        validate_before_commit=args.validate_before_commit,
+        site_paths=args.site_paths, max_retries=args.max_retries, branch=args.branch, remote=args.remote,
+        pages_cmd=args.pages_cmd, pages_workflow=args.pages_workflow, pages_ref=args.pages_ref,
+        pages_max_attempts=args.pages_max_attempts, pages_backoff=backoff or [5, 15],
+        pages_confirm_build=args.pages_confirm_build, pages_confirm_attempts=args.pages_confirm_attempts,
+        pages_confirm_interval=args.pages_confirm_interval,
+        deploy_recovery=args.deploy_recovery, recovery_site_paths=args.recovery_site_paths,
+        recovery_commit_grep=args.recovery_commit_grep, pages_status_cmd=args.pages_status_cmd,
+        author_name=args.author_name, author_email=args.author_email,
+        test_hook_before_push=args.test_hook_before_push, test_hook_fires=args.test_hook_fires,
+    )
+    try:
+        result = run_writeback(cfg)
+    except WritebackError as exc:
+        print("WRITEBACK_OUTCOME: error", flush=True)
+        sys.stderr.write(str(exc) + "\n")
+        return 3
+
+    print("WRITEBACK_SUMMARY: " + json.dumps(result.as_dict(), ensure_ascii=False), flush=True)
+    if args.json_out:
+        Path(args.json_out).write_text(json.dumps(result.as_dict(), indent=2), encoding="utf-8")
+    _write_github_output(result)
+    return 0 if result.ok else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

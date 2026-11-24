@@ -1,0 +1,132 @@
+name: option-a
+# P5b throwaway proof. Option A: a public workflow fetches a private (synthetic) module with a
+# read-only deploy key held as a secret of THIS public repository. Shaped like pages.yml plus a
+# writer lane: fetch, call, QA, writeback, cache save, build, gate, upload artifacts, summary.
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        type: choice
+        options: [clean, raise, warn, hang, kill, print]
+        default: clean
+      contain:
+        type: boolean
+        default: true
+      writeback:
+        type: boolean
+        default: false
+      bad_cache:
+        type: boolean
+        default: false
+      pin:
+        type: string
+        default: ''
+permissions:
+  contents: write
+concurrency:
+  group: option-a
+  cancel-in-progress: false
+jobs:
+  lane:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Fetch private module (Option A)
+        id: fetch
+        env:
+          KEY: ${{ secrets.P5B_PRIVATE_READ_KEY }}
+          PIN: ${{ inputs.pin }}
+        run: |
+          set -euo pipefail
+          umask 077
+          trap 'rm -f "$RUNNER_TEMP/k"' EXIT
+          if [ -z "$KEY" ]; then echo "private fetch: no key available"; exit 1; fi
+          printf '%s\n' "$KEY" > "$RUNNER_TEMP/k"
+          export GIT_SSH_COMMAND="ssh -i $RUNNER_TEMP/k -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new -o LogLevel=ERROR"
+          git clone -q git@github.com:auxchan/p5-canary-private.git "$RUNNER_TEMP/priv" || { echo "private fetch failed"; exit 1; }
+          rm -f "$RUNNER_TEMP/k"
+          PIN="${PIN:-$(cat .github/private.pin)}"
+          git -C "$RUNNER_TEMP/priv" checkout -q --detach "$PIN" 2>/dev/null || { echo "private fetch: pinned commit not found"; exit 1; }
+          echo "PRIVATE_DIR=$RUNNER_TEMP/priv/canary" >> "$GITHUB_ENV"
+          echo "private fetch: ok"
+
+      - name: Private step
+        id: call
+        timeout-minutes: 2
+        env:
+          P5B_MODE: ${{ inputs.mode }}
+        run: python auxsays/scripts/call_private.py --private-dir "$PRIVATE_DIR" ${{ inputs.contain && '--contain' || '--direct' }} --out auxsays/updates/generated/verdict.json
+
+      - name: Integrity suite (real run_integrity_tests.py)
+        if: always() && steps.fetch.outcome == 'success'
+        timeout-minutes: 3
+        env:
+          P5B_MODE: ${{ inputs.mode }}
+          P5B_CONTAIN: ${{ inputs.contain }}
+        run: python auxsays/scripts/ci/run_integrity_tests.py --suite blocking --receipt "$RUNNER_TEMP/receipt.json"
+
+      - name: Writeback (real automation_writeback.py)
+        if: always() && inputs.writeback && steps.fetch.outcome == 'success'
+        timeout-minutes: 3
+        env:
+          P5B_MODE: ${{ inputs.mode }}
+          P5B_CONTAIN: ${{ inputs.contain }}
+        run: |
+          printf '{"run": "%s"}\n' "$GITHUB_RUN_ID" > auxsays/updates/generated/run.json
+          python auxsays/scripts/lib/automation_writeback.py \
+            --message "P5b synthetic lane output" \
+            --allow auxsays/updates/generated \
+            --validate 'python auxsays/scripts/validate_output.py' \
+            --validate-before-commit \
+            --max-retries 3
+
+      - name: Shadow state for cache
+        if: always()
+        run: |
+          mkdir -p .shadow
+          cp -f auxsays/updates/generated/*.json .shadow/ 2>/dev/null || true
+          date -u > .shadow/stamp
+
+      - uses: actions/cache/save@v4
+        if: always()
+        with:
+          path: .shadow
+          key: shadow-${{ github.run_id }}-${{ github.run_attempt }}
+
+      - uses: actions/cache/save@v4
+        if: always() && inputs.bad_cache && steps.fetch.outcome == 'success'
+        with:
+          path: ${{ runner.temp }}/priv
+          key: badcache-${{ github.run_id }}-${{ github.run_attempt }}
+
+      - name: Build site and run the publish gate
+        if: always()
+        run: |
+          sudo gem install jekyll --no-document -q > /dev/null
+          jekyll build -s auxsays -d auxsays/_site -q
+          python auxsays/scripts/ci/verify_published_payload.py --site auxsays/_site
+
+      - uses: actions/upload-pages-artifact@v3
+        if: always()
+        with:
+          path: auxsays/_site
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: lane-outputs
+          path: |
+            auxsays/updates/generated/
+            ${{ runner.temp }}/receipt.json
+          if-no-files-found: warn
+
+      - name: Job summary
+        if: always()
+        run: |
+          {
+            echo "### p5b option-a lane"
+            echo "mode=${{ inputs.mode }} contain=${{ inputs.contain }} writeback=${{ inputs.writeback }}"
+            cat auxsays/updates/generated/verdict.json 2>/dev/null || echo "no verdict file"
+          } >> "$GITHUB_STEP_SUMMARY"

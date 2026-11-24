@@ -1,0 +1,3 @@
+# Synthetic manifest for the P5b boundary proof (throwaway repository).
+[blocking]
+auxsays/scripts/tests/test_canary_call.py = 2

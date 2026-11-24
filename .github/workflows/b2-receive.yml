@@ -1,0 +1,26 @@
+name: b2-receive
+# B2 (output-only): runs when the private repository pushes the ONE output file. Holds no secret.
+on:
+  push:
+    branches: [main]
+    paths: ['auxsays/data/b2_output.json']
+permissions:
+  contents: read
+jobs:
+  receive:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Verify the received output (closed set only)
+        run: |
+          python - <<'PY'
+          import json
+          d = json.load(open("auxsays/data/b2_output.json"))
+          assert set(d) == {"verdict", "produced_by_run", "produced_at"}, d
+          assert d["verdict"] in ("HOLD", "PASS"), d
+          print("received:", d)
+          PY
+          git log -1 --format='pushed by: %an <%ae> %s'

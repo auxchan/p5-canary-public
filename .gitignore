@@ -1,0 +1,5 @@
+__pycache__/
+*.pyc
+auxsays/_site/
+.jekyll-cache/
+.shadow/

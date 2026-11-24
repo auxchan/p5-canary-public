@@ -1,0 +1,45 @@
+name: cache-probe
+# P5b: from a SECOND workflow, restore every cache in this repository and search it for the canary.
+on: workflow_dispatch
+permissions:
+  actions: read
+  contents: read
+jobs:
+  list:
+    runs-on: ubuntu-latest
+    outputs:
+      keys: ${{ steps.l.outputs.keys }}
+    steps:
+      - id: l
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          keys=$(gh api "repos/${{ github.repository }}/actions/caches?per_page=100" -q '[.actions_caches[].key]')
+          echo "caches: $keys"
+          echo "keys=$keys" >> "$GITHUB_OUTPUT"
+  probe:
+    needs: list
+    if: needs.list.outputs.keys != '[]'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        key: ${{ fromJSON(needs.list.outputs.keys) }}
+    steps:
+      - uses: actions/cache/restore@v4
+        with:
+          path: .shadow
+          key: ${{ matrix.key }}
+      - uses: actions/cache/restore@v4
+        with:
+          path: ${{ runner.temp }}/priv
+          key: ${{ matrix.key }}
+      - name: Search restored content
+        run: |
+          echo "restored files:"
+          find .shadow "$RUNNER_TEMP/priv" -type f -not -path '*/.git/*' 2>/dev/null | head -50
+          if grep -rIlq --exclude-dir=.git "P5B-CANARY" .shadow "$RUNNER_TEMP/priv" 2>/dev/null; then
+            echo "CACHE_MARKER=found in ${{ matrix.key }}"
+          else
+            echo "CACHE_MARKER=absent in ${{ matrix.key }}"
+          fi
