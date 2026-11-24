@@ -80,7 +80,7 @@ jobs:
             --allow auxsays/updates/generated \
             --validate 'python auxsays/scripts/validate_output.py' \
             --validate-before-commit \
-            --max-retries 3
+            --max-retries 3 \n            --pages-cmd 'echo no-pages-in-throwaway'
 
       - name: Shadow state for cache
         if: always()
