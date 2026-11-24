@@ -30,6 +30,7 @@ jobs:
   lane:
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    environment: private-fetch
     steps:
       - uses: actions/checkout@v4
 
